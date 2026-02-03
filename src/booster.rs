@@ -304,6 +304,148 @@ impl Booster {
         Booster::new(handle)
     }
 
+    /// Trains a new model with validation dataset and early stopping.
+    ///
+    /// `early_stopping_rounds` in parameters is used to stop training when the
+    /// validation metric doesn't improve for N consecutive rounds. Additional
+    /// Additional parameters that can be provided with the `es_params` argument
+    /// include `max_empty_rounds`, `min_iterations` and `score_tolerance`. 
+    /// The paramters functions as below:
+    /// - Allows `max_empty_rounds` consecutive iterations with no split before
+    ///   bailing out (default: 5).
+    /// - Runs at least `min_iterations` number of iterations unless
+    ///   consecutive `max_empty_rounds` iterations have completed (default: 10).
+    /// - Allows a tolerance of `score_tolerance` for the new score to be
+    ///   worse before early stopping (score_tolerance: 1e-4.
+    /// 
+    ///
+    /// Example with early stopping:
+    /// ```
+    /// extern crate serde_json;
+    /// use lightgbm3::{Dataset, Booster};
+    /// use serde_json::json;
+    ///
+    /// let train_xs = vec![vec![1.0, 0.1], vec![0.7, 0.4], vec![0.9, 0.8], vec![0.2, 0.2]];
+    /// let train_labels = vec![0.0, 0.0, 1.0, 1.0];
+    /// let train_dataset = Dataset::from_vec_of_vec(train_xs, train_labels, true).unwrap();
+    ///
+    /// let valid_xs = vec![vec![0.8, 0.3], vec![0.3, 0.6]];
+    /// let valid_labels = vec![0.0, 1.0];
+    /// let valid_dataset = Dataset::from_vec_of_vec(valid_xs, valid_labels, true).unwrap();
+    ///
+    /// let params = json!{
+    ///    {
+    ///         "num_iterations": 100,
+    ///         "objective": "binary",
+    ///         "metric": "auc",
+    ///         "early_stopping_rounds": 20
+    ///     }
+    /// };
+    /// let es_params = json!{
+    ///    {
+    ///         "max_empty_rounds": 5,
+    ///         "min_iterations": 10,
+    ///         "score_tolerance": 1e-4,
+    ///    }
+    /// };
+    /// let bst = Booster::train_with_early_stopping(
+    ///     train_dataset, valid_dataset, &params, &es_params,
+    /// ).unwrap();
+    /// ```
+    pub fn train_with_early_stopping(
+        dataset: Dataset,
+        valid_dataset: Dataset,
+        parameters: &Value,
+        es_params: &Value,
+    ) -> Result<Self> {
+        let num_iterations: i64 = parameters["num_iterations"].as_i64().unwrap_or(100);
+        let early_stopping_rounds: i64 = parameters["early_stopping_rounds"].as_i64().unwrap_or(20);
+        // other parameters
+        let max_empty_rounds: i64 = es_params["max_empty_rounds"].as_i64().unwrap_or(5);
+        let min_iterations: i64 = es_params["min_iterations"].as_i64().unwrap_or(10);
+        let tolerance: f64 = es_params["score_tolerance"].as_f64().unwrap_or(1e-4);
+
+        let params_string = parameters
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let params_cstring = CString::new(params_string).unwrap();
+
+        let mut handle = std::ptr::null_mut();
+        lgbm_call!(lightgbm3_sys::LGBM_BoosterCreate(
+            dataset.handle,
+            params_cstring.as_ptr(),
+            &mut handle
+        ))?;
+
+        lgbm_call!(lightgbm3_sys::LGBM_BoosterAddValidData(
+            handle,
+            valid_dataset.handle
+        ))?;
+
+        let mut is_finished: i32 = 0;
+        let mut best_score: Option<f64> = None;
+        let mut rounds_without_improvement: i64 = 0;
+        let mut empty_trees: i64 = 0;
+
+        for iter in 1..=num_iterations {
+            lgbm_call!(lightgbm3_sys::LGBM_BoosterUpdateOneIter(
+                handle,
+                &mut is_finished
+            ))?;
+
+            if is_finished != 0 {
+                empty_trees += 1;
+                if empty_trees >= max_empty_rounds {
+                    break;
+                }
+            } else {
+                empty_trees = 0;
+            }
+
+            let eval_results = Self::get_eval_at(handle, 1)?;
+            if let Some(&current_score) = eval_results.first() {
+                let improved = match best_score {
+                    None => true,
+                    Some(best) => Self::is_score_better_tol(current_score, best, tolerance, parameters),
+                };
+
+                if improved {
+                    best_score = Some(current_score);
+                    rounds_without_improvement = 0;
+                } else {
+                    rounds_without_improvement += 1;
+                    if rounds_without_improvement >= early_stopping_rounds
+                        && rounds_without_improvement >= min_iterations {
+                        let rollback_iters = early_stopping_rounds.min(iter);
+                        for _ in 0..rollback_iters {
+                            lgbm_call!(lightgbm3_sys::LGBM_BoosterRollbackOneIter(handle))?;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        Booster::new(handle)
+    }
+
+    fn is_score_better_tol(current: f64, best: f64, tolerance: f64, parameters: &Value) -> bool {
+        let metric = parameters["metric"].as_str().unwrap_or("binary_logloss");
+        let higher_is_better = matches!(
+            metric,
+            "auc" | "average_precision" | "map" | "ndcg" | "accuracy"
+        );
+        if higher_is_better {
+            current > best + tolerance
+        } else {
+            current < best - tolerance
+        }
+    }
+
     fn is_score_better(current: f64, best: f64, parameters: &Value) -> bool {
         let metric = parameters["metric"].as_str().unwrap_or("binary_logloss");
         let higher_is_better = matches!(
