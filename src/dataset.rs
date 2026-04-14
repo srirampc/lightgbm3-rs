@@ -30,12 +30,14 @@ pub trait DType: private::Sealed {
 }
 
 impl DType for f32 {
+    #[inline(always)]
     fn get_c_api_dtype() -> i32 {
         C_API_DTYPE_FLOAT32 as i32
     }
 }
 
 impl DType for f64 {
+    #[inline(always)]
     fn get_c_api_dtype() -> i32 {
         C_API_DTYPE_FLOAT64 as i32
     }
@@ -125,20 +127,21 @@ impl Dataset {
         ))?;
 
         // 4. Convert C strings to Rust Strings
-        let mut result = Vec::with_capacity(num_features_out as usize);
-        for i in 0..num_features_out as usize {
-            // Create CStr from pointer
-            let c_str = unsafe { std::ffi::CStr::from_ptr(name_ptrs[i]) };
-            // Convert to Rust String (handle UTF-8)
-            let str_slice = c_str.to_str().map_err(|e| {
-                Error::new(format!(
-                    "Invalid UTF-8 in feature name at index {}: {}",
-                    i, e
-                ))
-            })?;
-            result.push(str_slice.to_string());
-        }
-
+        let result = name_ptrs
+            .iter()
+            .copied()
+            .take(num_features_out as usize)
+            .enumerate()
+            .map(|(i, ptr)| {
+                let c_str = unsafe { std::ffi::CStr::from_ptr(ptr) };
+                c_str.to_str().map(|s| s.to_string()).map_err(|e| {
+                    Error::new(format!(
+                        "Invalid UTF-8 in feature name at index {}: {}",
+                        i, e
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(result)
     }
 
@@ -197,7 +200,7 @@ impl Dataset {
         if n_features <= 0 {
             return Err(Error::new("number of features should be greater than 0"));
         }
-        if flat_x.len() % n_features as usize != 0 {
+        if !flat_x.len().is_multiple_of(n_features as usize) {
             return Err(Error::new(
                 "number of features doesn't correspond to slice size",
             ));
@@ -349,27 +352,27 @@ impl Dataset {
         if m == 0 {
             return Err(Error::new("DataFrame is empty"));
         }
-        if n < 1 {
+        if n < 2 {
             return Err(Error::new(
-                "DataFrame should contain at least 1 feature column and 1 label column",
+                "DataFrame should contain at least 1 feature column and a label column",
             ));
         }
 
         // Take label from the dataframe:
-        let label_series = dataframe.select_columns([label_column])?[0].cast(&Float32)?;
+        let label_series = dataframe
+            .drop_in_place(label_column)?
+            .cast(&DataType::Float32)?;
         if label_series.null_count() != 0 {
             return Err(Error::new(
                 "Can't create a dataset with null values in label array",
             ));
         }
-        let _ = dataframe.drop_in_place(label_column)?;
 
-        let mut label_values = Vec::with_capacity(m);
         let label_values_ca = label_series.f32()?;
-        label_values.extend(label_values_ca.into_no_null_iter());
+        let label_values: Vec<f32> = label_values_ca.into_no_null_iter().collect();
 
         let mut feature_values = Vec::with_capacity(m * (n - 1));
-        for series in dataframe.get_columns().iter() {
+        for series in dataframe.columns() {
             if series.null_count() != 0 {
                 return Err(Error::new(
                     "Can't create a dataset with null values in feature array",
@@ -380,6 +383,7 @@ impl Dataset {
             let ca = series.f32()?;
             feature_values.extend(ca.into_no_null_iter());
         }
+
         Self::from_slice(&feature_values, &label_values, (n - 1) as i32, false)
     }
 
@@ -397,26 +401,24 @@ impl Dataset {
         if m == 0 {
             return Err(Error::new("DataFrame is empty"));
         }
-        if n < 1 {
+        if n < 2 {
             return Err(Error::new(
-                "DataFrame should contain at least 1 feature column and 1 label column",
+                "DataFrame should contain at least 1 feature column and a label column",
             ));
         }
 
-        let label_series = dataframe.select_columns([label_column])?[0].cast(&Float32)?;
+        let label_series = dataframe.drop_in_place(label_column)?.cast(&Float32)?;
         if label_series.null_count() != 0 {
             return Err(Error::new(
                 "Can't create a dataset with null values in label array",
             ));
         }
-        let _ = dataframe.drop_in_place(label_column)?;
 
-        let mut label_values = Vec::with_capacity(m);
         let label_values_ca = label_series.f32()?;
-        label_values.extend(label_values_ca.into_no_null_iter());
+        let label_values: Vec<f32> = label_values_ca.into_no_null_iter().collect();
 
         let mut feature_values = Vec::with_capacity(m * (n - 1));
-        for series in dataframe.get_columns().iter() {
+        for series in dataframe.columns() {
             if series.null_count() != 0 {
                 return Err(Error::new(
                     "Can't create a dataset with null values in feature array",
@@ -427,6 +429,7 @@ impl Dataset {
             let ca = series.f32()?;
             feature_values.extend(ca.into_no_null_iter());
         }
+
         Self::from_slice_with_reference(
             &feature_values,
             &label_values,
